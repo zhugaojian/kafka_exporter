@@ -50,6 +50,7 @@ var (
 	topicPartitionInSyncReplicas       *prometheus.Desc
 	topicPartitionUsesPreferredReplica *prometheus.Desc
 	topicUnderReplicatedPartition      *prometheus.Desc
+	topicLogSize                       *prometheus.Desc
 	consumergroupCurrentOffset         *prometheus.Desc
 	consumergroupCurrentOffsetSum      *prometheus.Desc
 	consumergroupLag                   *prometheus.Desc
@@ -307,6 +308,7 @@ func (e *Exporter) Describe(ch chan<- *prometheus.Desc) {
 	ch <- topicPartitionInSyncReplicas
 	ch <- topicPartitionUsesPreferredReplica
 	ch <- topicUnderReplicatedPartition
+	ch <- topicLogSize
 	ch <- consumergroupCurrentOffset
 	ch <- consumergroupCurrentOffsetSum
 	ch <- consumergroupLag
@@ -376,6 +378,7 @@ func (e *Exporter) collect(ch chan<- prometheus.Metric) {
 	}
 
 	offset := make(map[string]map[int32]int64)
+	tmpLogSizes := make(map[int32]sarama.DescribeLogDirsRequest)
 
 	now := time.Now()
 
@@ -414,6 +417,7 @@ func (e *Exporter) collect(ch chan<- prometheus.Metric) {
 		)
 		e.mu.Lock()
 		offset[topic] = make(map[int32]int64, len(partitions))
+		tLD := make(map[int32]sarama.DescribeLogDirsRequestTopic)
 		e.mu.Unlock()
 		for _, partition := range partitions {
 			broker, err := e.client.Leader(topic, partition)
@@ -423,6 +427,10 @@ func (e *Exporter) collect(ch chan<- prometheus.Metric) {
 				ch <- prometheus.MustNewConstMetric(
 					topicPartitionLeader, prometheus.GaugeValue, float64(broker.ID()), topic, strconv.FormatInt(int64(partition), 10),
 				)
+				tLD[broker.ID()] = sarama.DescribeLogDirsRequestTopic{
+					Topic:        topic,
+					PartitionIDs: append(tLD[broker.ID()].PartitionIDs, partition),
+				}
 			}
 
 			currentOffset, err := e.client.GetOffset(topic, partition, sarama.OffsetNewest)
@@ -503,6 +511,10 @@ func (e *Exporter) collect(ch chan<- prometheus.Metric) {
 				}
 			}
 		}
+
+		for bid, v := range tLD {
+			tmpLogSizes[bid] = sarama.DescribeLogDirsRequest{DescribeTopics: append(tmpLogSizes[bid].DescribeTopics, v)}
+		}
 	}
 
 	loopTopics := func() {
@@ -542,6 +554,31 @@ func (e *Exporter) collect(ch chan<- prometheus.Metric) {
 	close(topicChannel)
 
 	wg.Wait()
+
+	// logSize
+	if e.client.Config().Version.IsAtLeast(sarama.V1_0_0_0) {
+		for b, tR := range tmpLogSizes {
+			broker, err := e.client.Broker(b)
+			if err != nil {
+				klog.Errorf("Cannot get broker: %v", err)
+				continue
+			}
+			logDirs, err := broker.DescribeLogDirs(&tR)
+			if err != nil {
+				klog.Errorf("Cannot get logDirs: %v", err)
+				return
+			}
+			for _, logDir := range logDirs.LogDirs {
+				for _, t := range logDir.Topics {
+					for _, par := range t.Partitions {
+						ch <- prometheus.MustNewConstMetric(
+							topicLogSize, prometheus.GaugeValue, float64(par.Size), t.Topic, strconv.FormatInt(int64(par.PartitionID), 10),
+						)
+					}
+				}
+			}
+		}
+	}
 
 	getConsumerGroupMetrics := func(broker *sarama.Broker) {
 		defer wg.Done()
@@ -890,6 +927,12 @@ func setup(
 		prometheus.BuildFQName(namespace, "consumergroup", "members"),
 		"Amount of members in a consumer group",
 		[]string{"consumergroup"}, labels,
+	)
+
+	topicLogSize = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "topic", "log_size"),
+		"Total bytes of log size",
+		[]string{"topic", "partition"}, labels,
 	)
 
 	if logSarama {
